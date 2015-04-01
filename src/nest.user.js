@@ -13,6 +13,12 @@
     return (token && unescape(token[1])) || null;
   }
 
+  var boardUrlRegex = /((^(https?:\/\/)?trello.com)?\/?b\/)?([^\/]+)\/?/;
+  function parseBoardUrl(url) {
+    var match = boardUrlRegex.exec(url);
+    return match[4] || null;
+  }
+
   function getBoard(cb) {
     var boardMatch = window.location.pathname.match(/^\/b\/(.*?)(\/|$)/);
     if (boardMatch) {
@@ -55,21 +61,36 @@
     return card || null;
   }
 
+  var establishingSocket = false;
   var currentSocket;
   function establishSocket() {
+    if (establishingSocket) return;
+    establishingSocket = true;
+
     var token = getLoginToken();
 
     getBoard(function (err, boardId) {
+      if (err) {
+        establishingSocket = false;
+        return;
+      }
+
       if (currentSocket) {
+        establishingSocket = false;
+
         currentSocket.close();
         currentSocket = null;
+        return; // reestablishing called by close
       }
 
       var reqId = 0;
       var socket = new WebSocket("wss://trello.com/1/Session/socket?token=" + token);
       currentSocket = socket;
+      establishingSocket = false;
+
       socket.onopen = function () {
         socket.send(JSON.stringify({ type: "ping", reqid: reqId++ }));
+        socket.send(JSON.stringify({ type: "setSessionStatus", status: "idle", reqid: reqId++ }));
         socket.send(JSON.stringify({ type: "subscribe", modelType: "Board", idModel: boardId, tags: ["clientActions", "updates"], invitationTokens: [], reqid: reqId++ }));
       };
 
@@ -93,6 +114,26 @@
           }
         }
       };
+
+      var intervalPing = setInterval(function () {
+        socket.send("");
+      }, 20000); // ping every 20 seconds
+      
+      var intervalActivity = setInterval(function () {
+        socket.send(JSON.stringify({ type: "setSessionStatus", status: "idle", idBoard: boardId, reqid: reqId++ }));
+      }, (5 * 60)* 1000); // ping every 5 minutes
+      
+      socket.onclose = function () {
+        clearInterval(intervalPing);
+        clearInterval(intervalActivity);
+        establishSocket();
+      };
+
+      socket.onerror = function () {
+        clearInterval(intervalPing);
+        clearInterval(intervalActivity);
+        establishSocket();
+      };
     });
   }
 
@@ -100,7 +141,7 @@
     var oldDesc = boardCards[cardId].desc;
     var newDesc = oldDesc ? oldDesc.replace(/\[\/\/\]:\s*#board\s*\((.*?)\)/, "[//]:#board(" + targetBoard + ")") : "[//]:#board(" + targetBoard + ")";
 
-    if (oldDesc === newDesc) {
+    if (oldDesc === newDesc && newDesc.indexOf("[//]:#board(" + targetBoard + ")") === -1) {
       newDesc += "\r\n\r\n[//]:#board(" + targetBoard + ")";
     }
 
@@ -122,7 +163,7 @@
   }
 
   function addLinkButton(buttonContainer) {
-    var linkBtn = $('<a href="#" class="button-link js-link-board-card" title="Link this card to another board."> <span class="icon-sm icon-card"></span> Link </a>');
+    var linkBtn = $('<a href="#" class="button-link js-link-board-card" title="Link this card to another board."> <span class="icon-sm icon-card"></span> Link board </a>');
     buttonContainer.append(linkBtn);
 
     linkBtn.on("click", function () {
@@ -132,7 +173,17 @@
       var target = prompt("Please provide the target board id");
       if (target === null) return;
 
-      linkCardToBoard(card, target);
+      target = parseBoardUrl(target);
+      if (target === null) {
+        alert('Failed to parse provided board url!');
+        return;
+      }
+
+      linkCardToBoard(card, target, function (err) {
+        if (err) {
+          alert('Linking the board failed! The error was: ' + (err.message || err));
+        }
+      });
     });
   }
 
@@ -236,7 +287,13 @@
       $target.parents(".list-card").trigger('click');
       ignoreEvent = false;
     } else {
-      window.location.href = "/b/" + board;
+      $.get(trelloAPI + "boards/" + board + "?fields=url")
+        .done(function (resp) {
+          window.location.href = resp.url;
+        })
+        .fail(function (xhr, status, err) {
+          alert("Can't find target board. The link might be broken or you might not have access to it.");
+        });
     }
 
     e.preventDefault();
